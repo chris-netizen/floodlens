@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.tif
+*.geojson
+*.csv
+*.html
+flood_mask.tif
+during_vv.tif
+pre_vv.tif
