@@ -163,7 +163,7 @@ st.caption("Upload a Sentinel-1 SAR image of a flood. Get the flooded area and t
 with st.sidebar:
     st.header("1 · Upload SAR")
     during_f = st.file_uploader(
-        "During-flood VV GeoTIFF (required)", type=["tif", "tiff"])
+        "During-flood VV GeoTIFF (required) — a sample (sample_maiduguri_vv.tif) is in the GitHub repo", type=["tif", "tiff"])
     pre_f = st.file_uploader("Pre-flood VV GeoTIFF (optional — enables change detection)",
                              type=["tif", "tiff"])
     band = st.number_input("VV band number", 1, 4, 1)
