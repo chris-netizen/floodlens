@@ -219,6 +219,13 @@ m1.metric("Schools exposed", f"{rows['schools'][1]} / {rows['schools'][0]}")
 m2.metric("Clinics & hospitals exposed",
           f"{rows['clinics'][1]} / {rows['clinics'][0]}")
 m3.metric("Road segments cut", f"{rows['roads'][1]:,}")
+st.caption(
+    "These counts come from FloodLens's **live SAR detection**, which is deliberately "
+    "conservative in dense urban areas (radar can't see water between buildings). The "
+    "Maiduguri case study reports higher headline figures because it uses the official, "
+    "hand-refined Copernicus EMSR753 extent — see the README. Both are the same tool, two "
+    "flood sources, honestly compared."
+)
 
 # map
 left, right = st.columns([3, 2])

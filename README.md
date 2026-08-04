@@ -1,4 +1,5 @@
 # FloodLens — flood exposure mapping with OpenStreetMap
+
 ### *"Flooded, and the Shelter Too"*
 
 A tool to map flood exposure from Sentinel-1 SAR imagery, and identify which schools,
@@ -26,7 +27,7 @@ dashboard to explore it.
 ## Data sources
 
 | Layer | Source | Access |
-|---|---|---|
+| --- | --- | --- |
 | Flood extent (authoritative) | Copernicus EMS **EMSR753** observed-event delineation | Copernicus EMS portal / HDX |
 | Flood extent (independent) | **Sentinel-1** SAR, VV, IW mode | Google Earth Engine / ASF |
 | Infrastructure | **OpenStreetMap** (schools, clinics, roads, buildings) | Overpass API (live) |
@@ -88,11 +89,22 @@ that removes permanent rivers and lakes. Permanent water (JRC) and steep terrain
 *Containment* (fraction of SAR inside the official extent) is the fair headline; IoU is
 lower only because the official layer also includes hand-mapped urban inundation.
 
-## Results (Maiduguri, vs EMSR753)
+## Results (Maiduguri)
+
+These headline figures are computed against the **official Copernicus EMSR753 flood extent**
+(the authoritative, hand-refined polygon):
 
 - Schools exposed: **7 / 41 mapped** · Clinics & hospitals: **16 / 78 mapped**
 - Buildings in flood zone: **~30,300 (~19%)** · Road segments cut: **~2,545**
-- **SAR vs official containment: 97.6%** (IoU 12.9% within the mapped AOI)
+- **Independent SAR vs official containment: 97.6%** (IoU 12.9% within the mapped AOI)
+
+**Two flood sources, one tool — read this to avoid confusion.** The interactive FloodLens app
+(`sar_flood_app.py`) runs its *own* SAR flood detection live from an uploaded image, so its
+on-screen counts are **lower** (e.g. ~3 schools / ~4 clinics) than the figures above. That is
+expected: live SAR detection is deliberately conservative in dense urban cores (radar can't
+see water between buildings), whereas the headline numbers use the official Copernicus extent,
+which includes hand-mapped urban inundation. Same method, two flood sources — the difference
+between them is itself the honest story of where SAR needs help.
 
 ---
 
@@ -107,9 +119,27 @@ detector cannot see these — which is why the independent SAR extent under-coun
 core (the reason the Maiduguri headline numbers use the official EMSR753 extent). This is a
 known property of SAR, not a bug in the method.
 
-**OSM completeness.** Exposure counts reflect what OpenStreetMap has mapped, not full ground
-truth — official reports counted ~56 schools flooded vs. 41 mapped in OSM. This gap is
-itself a finding and a call for stronger community mapping.
+**OSM completeness — and what the numbers mean.** This tool identifies **7 flooded
+schools**: those both mapped in OpenStreetMap *and* inside the observed flood extent.
+Humanitarian field reports (UN OCHA / UNICEF) later reported **~56 schools flooded** across
+the city. Comparing flooded-with-flooded, the distance between 7 and ~56 is not a detection
+failure — it measures two real data limitations:
+
+- **Map coverage.** OpenStreetMap has only **41 schools mapped in total** across this area —
+  fewer than the number reported flooded. The tool can only find flooded schools that are on
+  the map; the rest are invisible because no one has mapped them yet.
+- **Extent definition.** The satellite-observed flood polygon captures open standing water at
+  the moment of imaging; field teams counted schools "flooded/affected" over time and across
+  areas (shallow urban flooding, shelter damage) that a single water snapshot doesn't include.
+
+That gap *is* the finding. A facility-level tool is only as complete as the map beneath it,
+and here the open map holds fewer schools in total than one flood damaged. Quantifying that
+gap shows the OSM community exactly where mapping is most needed, and tells responders not to
+treat the map as complete. Strengthening OSM coverage directly improves the next response.
+
+Note also that Copernicus EMS publishes the flood *extent*, not a list of named affected
+facilities — identifying *which* schools and clinics were exposed is precisely what the
+OpenStreetMap overlay contributes.
 
 **Where this goes next:**
 

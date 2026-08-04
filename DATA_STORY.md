@@ -1,4 +1,5 @@
 # Flooded, and the Shelter Too
+
 ### How OpenStreetMap turns a multi-day damage assessment into a five-minute one
 
 On the night of 9–10 September 2024, the Alau Dam collapsed and the Ngadda River poured
@@ -51,13 +52,17 @@ emergency service produces. That puts disaster-response capability within anyone
 
 ## The honest gap — and the point
 
-The tool counts **7** flooded schools, but official reports counted **56 schools flooded** —
-because OpenStreetMap has only 41 schools mapped across this area. The numbers reflect *what
-the open map knows today*, not full ground truth. That gap is the most important finding:
-a tool like this is only as complete as the map beneath it, and the map is built by people.
-**Mapping your city before the next flood is what lets a tool like this save lives during
-it.** OpenStreetMap is a UN-endorsed Digital Public Good — but a public good only delivers
-value when people use it. This is one way to use it.
+This tool flags **7 flooded schools** — those OpenStreetMap has mapped *and* that sit
+inside the observed flood. Field assessment teams later reported **~56 schools flooded**
+across the city. The distance between those two numbers isn't a detection failure; it's a
+measure of how thin the open map still is. OpenStreetMap has only **41 schools mapped here in
+total** — fewer than the number one flood damaged — so most flooded schools were simply never
+on the map to be found. (And even the official satellite product maps only *where the water
+was*; naming *which* schools and clinics were hit is what OpenStreetMap adds.) That is the
+point that matters: a tool like this is only as complete as the map beneath it, and that map
+is built by people. **Mapping your city before the next flood is what lets a tool like this
+save lives during it.** OpenStreetMap is a UN-endorsed Digital Public Good — but a public
+good only delivers value when people use it. This is one way to use it.
 
 ## Limits, honestly — and what's next
 
