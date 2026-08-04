@@ -1,0 +1,12 @@
+streamlit
+streamlit-folium
+folium
+geopandas
+shapely
+rasterio
+pyproj
+numpy
+pandas
+scikit-image
+osmnx
+mapclassify
