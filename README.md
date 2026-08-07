@@ -8,6 +8,8 @@ and **validated against the official Copernicus EMS product (EMSR753)**.
 
 Built for **MapKaton 2026**.
 
+![FloodLens](flood_lens_image.png)
+
 ---
 
 ## Two things in this project
