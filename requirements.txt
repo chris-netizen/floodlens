@@ -10,3 +10,4 @@ pandas
 scikit-image
 osmnx
 mapclassify
+truststore

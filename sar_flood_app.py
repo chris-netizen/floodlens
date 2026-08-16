@@ -17,6 +17,17 @@ work: it is in radar geometry with uncalibrated values and needs terrain correct
 Optionally upload a pre-flood image of the same area to switch on change detection
 (which removes permanent rivers and lakes automatically).
 """
+# --- Use the OS certificate store for TLS. Some machines run antivirus (e.g. Avast)
+#     or a corporate proxy that intercepts HTTPS and presents its own root cert; that
+#     root is trusted by Windows but NOT by Python's bundled certifi list, so Overpass
+#     calls fail SSL verification and OSM silently returns 0 features. truststore makes
+#     Python trust whatever the OS trusts, fixing it without disabling the scanner. ---
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    pass
+
 import streamlit as st
 from streamlit_folium import st_folium
 import folium
@@ -117,20 +128,23 @@ def fetch_osm(bounds_wgs):
     left, bottom, right, top = bounds_wgs
     poly = box(left, bottom, right, top)
     layers = {}
+    errors = []
     for name, tags in OSM_TAGS.items():
         try:
             g = ox.features_from_polygon(poly, tags)
             g = g[~g.geometry.is_empty & g.geometry.notna()]
             layers[name] = g.to_crs(4326)
-        except Exception:
+        except Exception as e:
             layers[name] = gpd.GeoDataFrame(geometry=[], crs=4326)
+            errors.append(f"{name}: {type(e).__name__}: {e}")
     try:
         roads = ox.graph_to_gdfs(ox.graph_from_polygon(
             poly, network_type="drive"), nodes=False)
         layers["roads"] = roads.to_crs(4326)
-    except Exception:
+    except Exception as e:
         layers["roads"] = gpd.GeoDataFrame(geometry=[], crs=4326)
-    return layers
+        errors.append(f"roads: {type(e).__name__}: {e}")
+    return layers, errors
 
 
 def exposure(layers, flood_gdf):
@@ -208,7 +222,12 @@ _b = gpd.GeoSeries([box(*d_bounds)], crs=d_crs.to_wkt()
                    ).to_crs(4326).total_bounds
 bounds_wgs = (float(_b[0]), float(_b[1]), float(_b[2]), float(_b[3]))
 with st.spinner("Fetching OpenStreetMap infrastructure over the scene…"):
-    layers = fetch_osm(tuple(bounds_wgs))
+    layers, osm_errors = fetch_osm(tuple(bounds_wgs))
+if osm_errors:
+    st.warning(
+        "Could not reach OpenStreetMap (Overpass API) — infrastructure counts may be 0. "
+        "This is usually a network/SSL issue (antivirus or proxy HTTPS scanning), not the "
+        "flood sensitivity. Details:\n\n" + "\n\n".join(osm_errors))
 rows, exposed = exposure(layers, flood_gdf)
 
 # metrics
