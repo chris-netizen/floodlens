@@ -38,7 +38,7 @@ from shapely.geometry import box, shape
 from skimage.filters import threshold_otsu
 from scipy import ndimage as ndi
 from rasterio.warp import reproject, Resampling, transform_bounds
-from rasterio.features import shapes as rio_shapes
+from rasterio.features import shapes as rio_shapes, rasterize
 import rasterio
 import numpy as np
 import tempfile
@@ -302,6 +302,35 @@ def fetch_s1_vv(aoi_bounds, start, end, scale, orbit):
     return r.content, n_scenes
 
 
+@st.cache_data(show_spinner=False)
+def fetch_s2_water(aoi_bounds, start, end, scale):
+    """Independent optical check. Returns a 2-band GeoTIFF (bytes): band 1 = clear-sky
+    mask (1 where cloud/shadow-free), band 2 = water mask (1 where MNDWI>0 in clear sky),
+    plus the number of Sentinel-2 scenes used. Cloud + shadow are removed with Google's
+    Cloud Score+; MNDWI (green-SWIR) handles muddy floodwater better than NDWI. Because
+    flood debris/mud persists for days, a *later* clear pass still maps it even when the
+    flood day was fully clouded."""
+    import ee
+    import requests
+    w, s, e, n = aoi_bounds
+    aoi = ee.Geometry.Rectangle([w, s, e, n])
+    s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+          .filterBounds(aoi).filterDate(start, end)
+          .linkCollection(ee.ImageCollection("GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED"), ["cs"]))
+    n_scenes = int(s2.size().getInfo())
+    if n_scenes == 0:
+        raise RuntimeError(f"No Sentinel-2 scenes between {start} and {end}.")
+    comp = s2.map(lambda i: i.updateMask(i.select("cs").gte(0.6))).median()
+    clear = comp.select("B3").mask().rename("clear")
+    water = comp.normalizedDifference(["B3", "B11"]).gt(0.0).And(clear).rename("water")
+    out = clear.addBands(water).toByte().clip(aoi)
+    url = out.getDownloadURL({
+        "scale": scale, "region": aoi, "format": "GEO_TIFF", "crs": "EPSG:4326"})
+    r = requests.get(url, timeout=300)
+    r.raise_for_status()
+    return r.content, n_scenes
+
+
 # ------------------------------------------------------------------ UI
 st.title("FloodLens")
 st.caption("Pick a place and flood date — or upload a Sentinel-1 SAR image. Get the flooded "
@@ -320,6 +349,8 @@ with st.sidebar:
     place = flood_date = orbit = None
     window_days = aoi_km = scale_m = None
     use_change = True
+    validate_optical = False
+    opt_days = 21
 
     if source == "Upload GeoTIFF":
         during_f = st.file_uploader(
@@ -340,6 +371,14 @@ with st.sidebar:
                                      help="Removes permanent rivers/lakes by requiring pixels to have darkened.")
             scale_m = st.select_slider("Resolution (m/pixel)", [10, 20, 30], 20)
             orbit = st.selectbox("Orbit direction", ["Any", "ASCENDING", "DESCENDING"])
+            validate_optical = st.checkbox(
+                "Validate with optical (Sentinel-2)", True,
+                help="Independently confirm the SAR flood against optical water on cloud-free "
+                     "pixels. Because flood mud/debris persists, a later clear pass still maps it.")
+            opt_days = st.slider(
+                "Optical look-ahead (days after flood)", 3, 45, 21,
+                help="How long after the flood to search for a clear Sentinel-2 pass. Longer = "
+                     "more chance of clear sky as monsoon clouds lift, but water may recede.")
 
     st.header("2 · Detection")
     sensitivity = st.slider("Sensitivity (dB offset)", -5.0, 5.0, 0.0, 0.5,
@@ -448,6 +487,54 @@ if osm_errors:
         "flood sensitivity. Details:\n\n" + "\n\n".join(osm_errors))
 rows, exposed = exposure(layers, flood_gdf)
 
+# ---- optional: independent optical validation (auto-fetch only) ----
+optical_ready = False
+opt_overlay = opt_img_bounds = opt_note = None
+if source != "Upload GeoTIFF" and validate_optical:
+    o_start = flood_date.isoformat()
+    o_end = (flood_date + timedelta(days=opt_days)).isoformat()
+    try:
+        with st.spinner("Fetching Sentinel-2 optical for validation…"):
+            s2_bytes, n_s2 = fetch_s2_water(aoi, o_start, o_end, scale_m)
+        with rasterio.open(_write_tif(s2_bytes)) as s2src:
+            clear_arr = s2src.read(1)
+            water_arr = s2src.read(2)
+            o_transform, o_shape, o_b = s2src.transform, (s2src.height, s2src.width), s2src.bounds
+        clear_b = clear_arr > 0
+        opt_water = (water_arr > 0) & clear_b
+        coverage = float(clear_b.mean()) if clear_b.size else 0.0
+        px_km2 = (scale_m * scale_m) / 1e6
+        if coverage < 0.10:
+            opt_note = ("warn",
+                        f"⚠️ Too cloudy to validate: only {coverage*100:.0f}% of the scene was "
+                        f"cloud-free in the {opt_days}-day window ({n_s2} Sentinel-2 scenes). "
+                        "Optical confirmation withheld — try a longer look-ahead.")
+        else:
+            sar_ras = np.zeros(o_shape, dtype="uint8")
+            if not flood_gdf.empty:
+                sar_ras = rasterize(((g, 1) for g in flood_gdf.geometry),
+                                    out_shape=o_shape, transform=o_transform, fill=0, dtype="uint8")
+            sar_b = (sar_ras > 0) & clear_b
+            confirmed, sar_clear_n = int((sar_b & opt_water).sum()), int(sar_b.sum())
+            optical_ready = True
+            opt_img_bounds = [[o_b.bottom, o_b.left], [o_b.top, o_b.right]]
+            opt_overlay = np.zeros((o_shape[0], o_shape[1], 4), dtype="uint8")
+            opt_overlay[opt_water] = (0, 200, 255, 160)   # cyan where optical water
+            if sar_clear_n:
+                opt_note = ("ok",
+                            f"**Optical validation** · {coverage*100:.0f}% cloud-free "
+                            f"({n_s2} S2 scenes). **{100*confirmed/sar_clear_n:.0f}% of clear-sky "
+                            f"SAR flood is confirmed as water by Sentinel-2** "
+                            f"({confirmed*px_km2:.1f} of {sar_clear_n*px_km2:.1f} km²). "
+                            "Cyan overlay = optical water.")
+            else:
+                opt_note = ("info",
+                            f"**Optical validation** · {coverage*100:.0f}% cloud-free "
+                            f"({n_s2} S2 scenes). No SAR flood fell in clear-sky pixels to "
+                            "cross-check; optical water (cyan) is shown for reference.")
+    except Exception as e:
+        opt_note = ("warn", f"Optical validation unavailable: {type(e).__name__}: {e}")
+
 # metrics
 mode = "change detection (pre + during)" if pre_db is not None else "single-image Otsu"
 st.success(f"Flood detected · method: {mode} · water threshold ≈ {thr:.1f} dB")
@@ -464,6 +551,9 @@ st.caption(
     "flood sources, honestly compared."
 )
 
+if opt_note:
+    {"ok": st.success, "warn": st.warning, "info": st.info}[opt_note[0]](opt_note[1])
+
 # map
 left, right = st.columns([3, 2])
 with left:
@@ -472,14 +562,19 @@ with left:
     fmap = folium.Map(location=[c.y, c.x], zoom_start=11,
                       tiles="OpenStreetMap")
     if not flood_gdf.empty:
-        folium.GeoJson(flood_gdf, name="flood",
+        folium.GeoJson(flood_gdf, name="SAR flood",
                        style_function=lambda _: {"color": "#1f6feb", "weight": 1,
                                                  "fillColor": "#1f6feb", "fillOpacity": 0.4}).add_to(fmap)
+    if optical_ready and opt_overlay is not None:
+        folium.raster_layers.ImageOverlay(
+            image=opt_overlay, bounds=opt_img_bounds, opacity=0.6,
+            name="Optical water (Sentinel-2)", interactive=False).add_to(fmap)
     colors = {"schools": "#d7263d", "clinics": "#5c2d91"}
     for _, r in exposed.iterrows():
         p = r.geometry
         folium.CircleMarker([p.y, p.x], radius=4, color=colors.get(r.layer, "#333"),
                             fill=True, fill_opacity=0.9, popup=r.layer).add_to(fmap)
+    folium.LayerControl(collapsed=True).add_to(fmap)
     st_folium(fmap, use_container_width=True, height=560, returned_objects=[])
 
 with right:
@@ -507,6 +602,13 @@ since before, which removes permanent rivers, lakes, and other always-dark surfa
 
 **Exposure.** Schools, clinics, and roads are pulled live from **OpenStreetMap** over the
 image footprint; a facility counts as exposed when it lies inside the detected flood.
+
+**Optical validation (auto-fetch).** As an independent check, FloodLens can pull **Sentinel-2**
+optical over the same area, mask cloud and shadow with **Cloud Score+**, and map water with
+**MNDWI**. On the cloud-free pixels it reports what fraction of the SAR flood is optically
+confirmed as water (cyan overlay). Because flood mud and debris *persist*, a clear pass in the
+days/weeks after the event still maps the impact even when the flood day itself was overcast —
+and when too little of the scene is clear, the tool says so rather than reporting a weak number.
 
 **Getting the image.** *Auto-fetch* pulls Sentinel-1 VV straight from Google Earth Engine for
 the place and date you choose (a median composite over a short window, with a dry pre-flood

@@ -12,3 +12,4 @@ osmnx
 mapclassify
 truststore
 earthengine-api
+pillow
