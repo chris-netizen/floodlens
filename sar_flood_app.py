@@ -114,7 +114,8 @@ def despeckle(db, size):
 
 
 def detect_flood(during_db, pre_db, sensitivity, transform, crs, min_area_m2,
-                 speckle_win=5, change_drop=2.0, water_ceiling=-10.0):
+                 speckle_win=5, change_drop=2.0, water_ceiling=-10.0,
+                 hand_arr=None, hand_max=15.0):
     """Otsu water threshold on a despeckled during image; if a pre image is supplied,
     also require the pixel to have *meaningfully* darkened (change detection) to drop
     permanent water and seasonal land change.
@@ -125,6 +126,9 @@ def detect_flood(during_db, pre_db, sensitivity, transform, crs, min_area_m2,
                        darkening), which removes monsoon farmland/soil-moisture change.
       • water_ceiling— caps the auto threshold so damp land can't be read as water when
                        Otsu drifts high (matters most in single-image mode).
+      • hand_arr/max — Height Above Nearest Drainage mask: drop pixels sitting more than
+                       hand_max metres above the nearest river (they can't physically
+                       flood), removing steep-terrain radar shadow/layover artifacts.
       • morphological opening + area filter remove residual isolated specks.
     """
     during_s = despeckle(during_db, speckle_win)
@@ -139,6 +143,10 @@ def detect_flood(during_db, pre_db, sensitivity, transform, crs, min_area_m2,
         diff = during_s - pre_s
         # must have darkened by a meaningful margin, not just any amount
         water &= np.isfinite(diff) & (diff < -abs(change_drop))
+
+    # terrain mask: only pixels low enough above drainage can flood
+    if hand_arr is not None:
+        water &= np.isfinite(hand_arr) & (hand_arr <= float(hand_max))
 
     # break isolated-pixel speckle bridges before vectorizing
     if water.any():
@@ -331,6 +339,23 @@ def fetch_s2_water(aoi_bounds, start, end, scale):
     return r.content, n_scenes
 
 
+@st.cache_data(show_spinner=False)
+def fetch_hand(aoi_bounds, scale):
+    """Height Above Nearest Drainage (m) from MERIT Hydro, as a GeoTIFF (bytes). A pixel's
+    HAND is how high it sits above the river it drains to; pixels far above any drainage
+    can't physically flood, so they're used to mask out steep-terrain SAR artifacts."""
+    import ee
+    import requests
+    w, s, e, n = aoi_bounds
+    aoi = ee.Geometry.Rectangle([w, s, e, n])
+    hnd = ee.Image("MERIT/Hydro/v1_0_1").select("hnd").clip(aoi).toFloat()
+    url = hnd.getDownloadURL({
+        "scale": scale, "region": aoi, "format": "GEO_TIFF", "crs": "EPSG:4326"})
+    r = requests.get(url, timeout=240)
+    r.raise_for_status()
+    return r.content
+
+
 # ------------------------------------------------------------------ UI
 st.title("FloodLens")
 st.caption("Pick a place and flood date — or upload a Sentinel-1 SAR image. Get the flooded "
@@ -351,6 +376,8 @@ with st.sidebar:
     use_change = True
     validate_optical = False
     opt_days = 21
+    use_hand = False
+    hand_max = 15
 
     if source == "Upload GeoTIFF":
         during_f = st.file_uploader(
@@ -371,6 +398,13 @@ with st.sidebar:
                                      help="Removes permanent rivers/lakes by requiring pixels to have darkened.")
             scale_m = st.select_slider("Resolution (m/pixel)", [10, 20, 30], 20)
             orbit = st.selectbox("Orbit direction", ["Any", "ASCENDING", "DESCENDING"])
+            use_hand = st.checkbox(
+                "Terrain mask (HAND)", True,
+                help="Drop pixels too high above the nearest river to flood — removes "
+                     "steep-terrain radar shadow/layover artifacts. Harmless on flat areas.")
+            hand_max = st.slider(
+                "Max height above drainage (m)", 2, 40, 15,
+                help="Pixels more than this many metres above the nearest drainage are masked out.")
             validate_optical = st.checkbox(
                 "Validate with optical (Sentinel-2)", True,
                 help="Independently confirm the SAR flood against optical water on cloud-free "
@@ -465,10 +499,31 @@ if pre_path is not None:
     p_arr, p_tr, p_crs, _, _ = _read_band(pre_path, band)
     pre_db = align_to(during_db.shape, d_tr, d_crs, to_db(p_arr), p_tr, p_crs)
 
+# terrain (HAND) mask, aligned to the during grid — auto-fetch only
+hand_arr = None
+if source != "Upload GeoTIFF" and use_hand:
+    try:
+        with st.spinner("Fetching terrain (Height Above Nearest Drainage)…"):
+            h_bytes = fetch_hand(aoi, scale_m)
+        with rasterio.open(_write_tif(h_bytes)) as hsrc:
+            h_src = hsrc.read(1).astype("float32")
+            if hsrc.nodata is not None:
+                h_src[h_src == hsrc.nodata] = np.nan
+            h_tr, h_crs = hsrc.transform, hsrc.crs
+        hand_arr = np.full(during_db.shape, np.nan, dtype="float32")
+        reproject(source=h_src, destination=hand_arr,
+                  src_transform=h_tr, src_crs=h_crs,
+                  dst_transform=d_tr, dst_crs=d_crs, resampling=Resampling.bilinear)
+    except Exception as e:
+        st.warning(f"Terrain (HAND) mask unavailable — proceeding without it: "
+                   f"{type(e).__name__}: {e}")
+        hand_arr = None
+
 with st.spinner("Detecting flooded area…"):
     flood_gdf, thr = detect_flood(
         during_db, pre_db, sensitivity, d_tr, d_crs.to_wkt(), min_area,
-        speckle_win=speckle_win, change_drop=change_drop, water_ceiling=water_ceiling)
+        speckle_win=speckle_win, change_drop=change_drop, water_ceiling=water_ceiling,
+        hand_arr=hand_arr, hand_max=hand_max)
 
 if d_crs is None:
     st.error("This GeoTIFF has no coordinate system (CRS). Upload a geocoded image "
@@ -615,6 +670,12 @@ the place and date you choose (a median composite over a short window, with a dr
 baseline for change detection) — no GIS software or manual downloads. The `COPERNICUS/S1_GRD`
 VV band is already calibrated backscatter in dB, the same quantity a terrain-corrected upload
 provides. Prefer *Upload* when you have your own analysis-ready scene (ASF RTC / SNAP export).
+
+**Terrain masking (auto-fetch).** In hilly or mountainous scenes, radar shadow and layover
+on slopes can masquerade as water. FloodLens masks these with **HAND** (Height Above Nearest
+Drainage, from MERIT Hydro): any pixel sitting more than a set height above the nearest river
+can't physically flood, so it's excluded. This is harmless on flat terrain and removes most
+false positives on steep terrain.
 
 **Limits.** Radar struggles to see shallow water between dense buildings, so urban cores may
 be under-detected — keep the pre-flood baseline on and adjust *Sensitivity* if needed. Exposure
