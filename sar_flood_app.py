@@ -397,7 +397,12 @@ with st.sidebar:
             use_change = st.checkbox("Use a pre-flood baseline (change detection)", True,
                                      help="Removes permanent rivers/lakes by requiring pixels to have darkened.")
             scale_m = st.select_slider("Resolution (m/pixel)", [10, 20, 30], 20)
-            orbit = st.selectbox("Orbit direction", ["Any", "ASCENDING", "DESCENDING"])
+            orbit = st.selectbox(
+                "Orbit direction",
+                ["Any", "ASCENDING", "DESCENDING", "Merge (ascending + descending)"],
+                help="Merge detects flood from each look direction separately (each with its "
+                     "own matching baseline) and unions them, filling radar shadow/layover "
+                     "gaps one direction misses. Slower (two fetches) but best in terrain/cities.")
             use_hand = st.checkbox(
                 "Terrain mask (HAND)", True,
                 help="Drop pixels too high above the nearest river to flood — removes "
@@ -433,8 +438,10 @@ with st.sidebar:
         st.caption("Input must be a geocoded, calibrated VV GeoTIFF (e.g. ASF RTC, or a "
                    "SNAP/GEE export) — not a raw .SAFE package.")
 
-# ---- resolve the input to a during (+ optional pre) GeoTIFF path ----
-during_path = pre_path = None
+# ---- resolve the input to one or more detection jobs ----
+# Each job is a (during_path, pre_path, label). Usually one; orbit-merge makes two
+# (ascending + descending), detected separately and unioned to fill shadow/layover gaps.
+jobs = []
 
 if source == "Upload GeoTIFF":
     if during_f is None:
@@ -442,9 +449,9 @@ if source == "Upload GeoTIFF":
                 "the cleanest result — change detection automatically ignores permanent rivers "
                 "and lakes.")
         st.stop()
-    during_path = _write_tif(during_f.getbuffer())
-    if pre_f is not None:
-        pre_path = _write_tif(pre_f.getbuffer())
+    jobs.append({"during_path": _write_tif(during_f.getbuffer()),
+                 "pre_path": _write_tif(pre_f.getbuffer()) if pre_f is not None else None,
+                 "label": "upload"})
 else:
     ok, detail = init_ee()
     if not ok:
@@ -469,61 +476,98 @@ else:
                  "(e.g. add the country).")
         st.stop()
     aoi = bbox_km(lat, lon, aoi_km)
-    orbit_f = orbit if orbit in ("ASCENDING", "DESCENDING") else None
+    if orbit == "Merge (ascending + descending)":
+        dirs = ["ASCENDING", "DESCENDING"]
+    elif orbit in ("ASCENDING", "DESCENDING"):
+        dirs = [orbit]
+    else:
+        dirs = [None]  # "Any" — no orbit filter
     post_start = (flood_date - timedelta(days=3)).isoformat()
     post_end = (flood_date + timedelta(days=window_days)).isoformat()
     pre_end = (flood_date - timedelta(days=30)).isoformat()
     pre_start = (flood_date - timedelta(days=30 + max(window_days, 24))).isoformat()
-    try:
-        with st.spinner(f"Fetching Sentinel-1 over {place} from Earth Engine…"):
-            d_bytes, n_post = fetch_s1_vv(aoi, post_start, post_end, scale_m, orbit_f)
-            during_path = _write_tif(d_bytes)
-            n_pre = 0
+    msgs = []
+    with st.spinner(f"Fetching Sentinel-1 over {place} from Earth Engine…"):
+        for od in dirs:
+            try:
+                d_bytes, n_post = fetch_s1_vv(aoi, post_start, post_end, scale_m, od)
+            except Exception as e:
+                if len(dirs) > 1:
+                    msgs.append(f"{od.lower()}: no during scene, skipped")
+                    continue
+                st.error(f"Earth Engine fetch failed: {type(e).__name__}: {e}")
+                st.stop()
+            pp, n_pre = None, 0
             if use_change:
-                p_bytes, n_pre = fetch_s1_vv(aoi, pre_start, pre_end, scale_m, orbit_f)
-                pre_path = _write_tif(p_bytes)
-    except Exception as e:
-        st.error(f"Earth Engine fetch failed: {type(e).__name__}: {e}")
+                try:
+                    p_bytes, n_pre = fetch_s1_vv(aoi, pre_start, pre_end, scale_m, od)
+                    pp = _write_tif(p_bytes)
+                except Exception:
+                    n_pre = 0  # no matching baseline for this orbit → single-image for it
+            jobs.append({"during_path": _write_tif(d_bytes), "pre_path": pp,
+                         "label": (od or "any").lower()})
+            msgs.append(f"{(od or 'any').lower()}: {n_post} during"
+                        + (f" + {n_pre} pre" if use_change else ""))
+    if not jobs:
+        st.error("No Sentinel-1 scenes found for either orbit in this window. "
+                 "Try a wider window or a different date.")
         st.stop()
-    st.success(
-        f"Fetched Sentinel-1 VV over **{place}** ({lat:.3f}, {lon:.3f}): {n_post} during-scene(s)"
-        + (f" + {n_pre} pre-flood scene(s)" if use_change else "")
-        + f", composited at {scale_m} m/pixel.")
+    st.success(f"Fetched Sentinel-1 VV over **{place}** ({lat:.3f}, {lon:.3f}) at "
+               f"{scale_m} m/pixel — " + "; ".join(msgs) + ".")
 
-# ---- shared: read the resolved raster(s) into the detection pipeline ----
-d_arr, d_tr, d_crs, d_bounds, d_count = _read_band(during_path, band)
-during_db = to_db(d_arr)
-
-pre_db = None
-if pre_path is not None:
-    p_arr, p_tr, p_crs, _, _ = _read_band(pre_path, band)
-    pre_db = align_to(during_db.shape, d_tr, d_crs, to_db(p_arr), p_tr, p_crs)
-
-# terrain (HAND) mask, aligned to the during grid — auto-fetch only
+# ---- read + detect per job, then union (orbit-merge yields two jobs) ----
+backdrop = None          # (during_db, d_tr, d_crs, d_bounds) from the first job, for display
 hand_arr = None
-if source != "Upload GeoTIFF" and use_hand:
-    try:
-        with st.spinner("Fetching terrain (Height Above Nearest Drainage)…"):
-            h_bytes = fetch_hand(aoi, scale_m)
-        with rasterio.open(_write_tif(h_bytes)) as hsrc:
-            h_src = hsrc.read(1).astype("float32")
-            if hsrc.nodata is not None:
-                h_src[h_src == hsrc.nodata] = np.nan
-            h_tr, h_crs = hsrc.transform, hsrc.crs
-        hand_arr = np.full(during_db.shape, np.nan, dtype="float32")
-        reproject(source=h_src, destination=hand_arr,
-                  src_transform=h_tr, src_crs=h_crs,
-                  dst_transform=d_tr, dst_crs=d_crs, resampling=Resampling.bilinear)
-    except Exception as e:
-        st.warning(f"Terrain (HAND) mask unavailable — proceeding without it: "
-                   f"{type(e).__name__}: {e}")
-        hand_arr = None
-
+change_used = False
+flood_parts, thr_list = [], []
 with st.spinner("Detecting flooded area…"):
-    flood_gdf, thr = detect_flood(
-        during_db, pre_db, sensitivity, d_tr, d_crs.to_wkt(), min_area,
-        speckle_win=speckle_win, change_drop=change_drop, water_ceiling=water_ceiling,
-        hand_arr=hand_arr, hand_max=hand_max)
+    for job in jobs:
+        d_arr, d_tr, d_crs, d_bounds, _ = _read_band(job["during_path"], band)
+        job_during = to_db(d_arr)
+        job_pre = None
+        if job["pre_path"] is not None:
+            p_arr, p_tr, p_crs, _, _ = _read_band(job["pre_path"], band)
+            job_pre = align_to(job_during.shape, d_tr, d_crs, to_db(p_arr), p_tr, p_crs)
+            change_used = True
+        if backdrop is None:
+            backdrop = (job_during, d_tr, d_crs, d_bounds)
+            if source != "Upload GeoTIFF" and use_hand:
+                try:
+                    with st.spinner("Fetching terrain (Height Above Nearest Drainage)…"):
+                        h_bytes = fetch_hand(aoi, scale_m)
+                    with rasterio.open(_write_tif(h_bytes)) as hsrc:
+                        h_src = hsrc.read(1).astype("float32")
+                        if hsrc.nodata is not None:
+                            h_src[h_src == hsrc.nodata] = np.nan
+                        h_tr, h_crs = hsrc.transform, hsrc.crs
+                    hand_arr = np.full(job_during.shape, np.nan, dtype="float32")
+                    reproject(source=h_src, destination=hand_arr,
+                              src_transform=h_tr, src_crs=h_crs,
+                              dst_transform=d_tr, dst_crs=d_crs, resampling=Resampling.bilinear)
+                except Exception as e:
+                    st.warning(f"Terrain (HAND) mask unavailable — proceeding without it: "
+                               f"{type(e).__name__}: {e}")
+                    hand_arr = None
+        hand_i = hand_arr if (hand_arr is not None and job_during.shape == backdrop[0].shape) else None
+        flood_i, thr_i = detect_flood(
+            job_during, job_pre, sensitivity, d_tr, d_crs.to_wkt(), min_area,
+            speckle_win=speckle_win, change_drop=change_drop, water_ceiling=water_ceiling,
+            hand_arr=hand_i, hand_max=hand_max)
+        flood_parts.append(flood_i)
+        thr_list.append(thr_i)
+
+during_db, d_tr, d_crs, d_bounds = backdrop
+pre_db = True if change_used else None   # only used downstream to label the method
+thr = min(thr_list) if thr_list else float("nan")
+nonempty = [f for f in flood_parts if not f.empty]
+if not nonempty:
+    flood_gdf = gpd.GeoDataFrame(geometry=[], crs=4326)
+elif len(nonempty) == 1:
+    flood_gdf = nonempty[0]
+else:
+    merged = gpd.GeoDataFrame(pd.concat(nonempty, ignore_index=True), crs=4326).union_all()
+    flood_gdf = gpd.GeoDataFrame(
+        geometry=list(getattr(merged, "geoms", [merged])), crs=4326)
 
 if d_crs is None:
     st.error("This GeoTIFF has no coordinate system (CRS). Upload a geocoded image "
