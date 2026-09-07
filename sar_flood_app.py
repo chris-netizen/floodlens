@@ -172,6 +172,16 @@ def detect_flood(during_db, pre_db, sensitivity, transform, crs, min_area_m2,
 def fetch_osm(bounds_wgs):
     left, bottom, right, top = bounds_wgs
     poly = box(left, bottom, right, top)
+
+    def _benign(e):
+        # OSMnx raises when an area simply has none of a feature (e.g. no drivable
+        # roads in a remote/mountain AOI). That's "0 found", not a failure — keep it
+        # out of the errors list so it isn't mistaken for a connection/SSL problem.
+        m = str(e).lower()
+        return any(s in m for s in (
+            "no edges", "no graph nodes", "found no", "insufficient response",
+            "no data elements", "no matching features"))
+
     layers = {}
     errors = []
     for name, tags in OSM_TAGS.items():
@@ -181,14 +191,16 @@ def fetch_osm(bounds_wgs):
             layers[name] = g.to_crs(4326)
         except Exception as e:
             layers[name] = gpd.GeoDataFrame(geometry=[], crs=4326)
-            errors.append(f"{name}: {type(e).__name__}: {e}")
+            if not _benign(e):
+                errors.append(f"{name}: {type(e).__name__}: {e}")
     try:
         roads = ox.graph_to_gdfs(ox.graph_from_polygon(
             poly, network_type="drive"), nodes=False)
         layers["roads"] = roads.to_crs(4326)
     except Exception as e:
         layers["roads"] = gpd.GeoDataFrame(geometry=[], crs=4326)
-        errors.append(f"roads: {type(e).__name__}: {e}")
+        if not _benign(e):
+            errors.append(f"roads: {type(e).__name__}: {e}")
     return layers, errors
 
 
@@ -581,9 +593,10 @@ with st.spinner("Fetching OpenStreetMap infrastructure over the scene…"):
     layers, osm_errors = fetch_osm(tuple(bounds_wgs))
 if osm_errors:
     st.warning(
-        "Could not reach OpenStreetMap (Overpass API) — infrastructure counts may be 0. "
-        "This is usually a network/SSL issue (antivirus or proxy HTTPS scanning), not the "
-        "flood sensitivity. Details:\n\n" + "\n\n".join(osm_errors))
+        "Some OpenStreetMap layers couldn't be loaded, so their counts may be 0. "
+        "A connection/SSL error here is usually antivirus or proxy HTTPS scanning, not the "
+        "flood detection (an area with a feature simply unmapped shows 0 without an error). "
+        "Details:\n\n" + "\n\n".join(osm_errors))
 rows, exposed = exposure(layers, flood_gdf)
 
 # ---- optional: independent optical validation (auto-fetch only) ----

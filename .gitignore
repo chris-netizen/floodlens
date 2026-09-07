@@ -7,3 +7,5 @@ __pycache__/
 flood_mask.tif
 during_vv.tif
 pre_vv.tif
+cache/
+*.tif.aux.xml
