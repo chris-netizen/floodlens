@@ -168,6 +168,36 @@ def detect_flood(during_db, pre_db, sensitivity, transform, crs, min_area_m2,
 
 
 # ------------------------------------------------------------------ OSM + exposure
+# Public Overpass endpoints, tried in order — overpass-api.de sometimes refuses
+# connections from shared cloud IPs (e.g. Streamlit Cloud), so we fall back to a mirror.
+OVERPASS_ENDPOINTS = ["https://overpass-api.de/api",
+                      "https://overpass.kumi.systems/api",
+                      "https://overpass.osm.ch/api"]
+
+
+def _osm_call(fn):
+    """Run an OSMnx fetch, retrying on the next Overpass mirror if one refuses the
+    connection or times out. Non-connection errors (incl. 'no data found') propagate
+    immediately so the caller can classify them."""
+    last = None
+    for ep in OVERPASS_ENDPOINTS:
+        try:
+            ox.settings.overpass_url = ep
+        except Exception:
+            pass
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            m = str(e).lower()
+            transient = any(s in m for s in (
+                "connection", "max retries", "timed out", "timeout", "refused",
+                "temporarily", "502", "503", "504", "gateway"))
+            if not transient:
+                raise
+    raise last
+
+
 @st.cache_data(show_spinner=False)
 def fetch_osm(bounds_wgs):
     left, bottom, right, top = bounds_wgs
@@ -186,7 +216,7 @@ def fetch_osm(bounds_wgs):
     errors = []
     for name, tags in OSM_TAGS.items():
         try:
-            g = ox.features_from_polygon(poly, tags)
+            g = _osm_call(lambda t=tags: ox.features_from_polygon(poly, t))
             g = g[~g.geometry.is_empty & g.geometry.notna()]
             layers[name] = g.to_crs(4326)
         except Exception as e:
@@ -194,8 +224,8 @@ def fetch_osm(bounds_wgs):
             if not _benign(e):
                 errors.append(f"{name}: {type(e).__name__}: {e}")
     try:
-        roads = ox.graph_to_gdfs(ox.graph_from_polygon(
-            poly, network_type="drive"), nodes=False)
+        roads = ox.graph_to_gdfs(_osm_call(lambda: ox.graph_from_polygon(
+            poly, network_type="drive")), nodes=False)
         layers["roads"] = roads.to_crs(4326)
     except Exception as e:
         layers["roads"] = gpd.GeoDataFrame(geometry=[], crs=4326)
@@ -423,9 +453,10 @@ with st.sidebar:
                 "Max height above drainage (m)", 2, 40, 15,
                 help="Pixels more than this many metres above the nearest drainage are masked out.")
             validate_optical = st.checkbox(
-                "Validate with optical (Sentinel-2)", True,
+                "Validate with optical (Sentinel-2) — slower", False,
                 help="Independently confirm the SAR flood against optical water on cloud-free "
-                     "pixels. Because flood mud/debris persists, a later clear pass still maps it.")
+                     "pixels. Because flood mud/debris persists, a later clear pass still maps it. "
+                     "Off by default: it reads several Sentinel-2 scenes and adds ~1–2 minutes.")
             opt_days = st.slider(
                 "Optical look-ahead (days after flood)", 3, 45, 21,
                 help="How long after the flood to search for a clear Sentinel-2 pass. Longer = "
@@ -449,6 +480,19 @@ with st.sidebar:
     if source == "Upload GeoTIFF":
         st.caption("Input must be a geocoded, calibrated VV GeoTIFF (e.g. ASF RTC, or a "
                    "SNAP/GEE export) — not a raw .SAFE package.")
+
+    st.divider()
+    run_clicked = st.button("🌊 Run analysis", type="primary", use_container_width=True)
+
+# Gate the heavy pipeline behind an explicit click, so the page loads instantly and nothing
+# is fetched until the visitor asks for it (important on a shared/public deployment).
+if run_clicked:
+    st.session_state["ran"] = True
+if not st.session_state.get("ran"):
+    st.info("⬅️ Set your **place, date, and options** in the sidebar, then click "
+            "**🌊 Run analysis**. Fetching Sentinel-1 and mapping the flood takes ~30–60s "
+            "(longer with optical validation switched on).")
+    st.stop()
 
 # ---- resolve the input to one or more detection jobs ----
 # Each job is a (during_path, pre_path, label). Usually one; orbit-merge makes two
