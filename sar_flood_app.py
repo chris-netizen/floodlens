@@ -32,6 +32,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 import folium
 import osmnx as ox
+import requests
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import box, shape
@@ -174,105 +175,69 @@ def detect_flood(during_db, pre_db, sensitivity, transform, crs, min_area_m2,
 
 
 # ------------------------------------------------------------------ OSM + exposure
-# Public Overpass endpoints, tried in order — overpass-api.de sometimes refuses
-# connections from shared cloud IPs (e.g. Streamlit Cloud), so we fall back to a mirror.
-OVERPASS_ENDPOINTS = ["https://overpass-api.de/api",
-                      "https://overpass.kumi.systems/api",
-                      "https://overpass.osm.ch/api"]
-
-# Keep OSMnx's request pacing ON: Overpass limits requests per IP, and firing the
-# schools / clinics / roads queries back-to-back gets the later (heavier) ones rejected —
-# which showed up as clinics and roads silently returning 0 while schools loaded. The
-# rate limiter waits for the server's slot so each query succeeds. Use a generous-but-
-# bounded timeout so the heavy road-network graph completes without hanging for minutes.
-try:
-    ox.settings.requests_timeout = 120
-    ox.settings.overpass_rate_limit = True
-except Exception:
-    pass
+# OSM data comes from Postpass (Geofabrik's public OpenStreetMap PostGIS service) instead
+# of the Overpass API: it takes plain SQL over HTTP and returns GeoJSON, and — crucially —
+# doesn't rate-limit shared cloud IPs the way the public Overpass instances do, which was
+# making clinics and roads silently return 0 on Streamlit Cloud.
+POSTPASS_URL = "https://postpass.geofabrik.de/api/interpreter"
+OSM_UNAVAILABLE = "__osm_unavailable__"     # sentinel prefix in the errors list
+_ROAD_CLASSES = ",".join(f"'{c}'" for c in ROAD_TAGS["highway"])
+# SQL conditions per facility layer (against the combined point+polygon table)
+FACILITY_COND = {
+    "schools": "tags->>'amenity'='school'",
+    "clinics": "(tags->>'amenity' IN ('clinic','hospital','doctors') OR tags ? 'healthcare')",
+}
 
 
-OSM_UNAVAILABLE = "__osm_unavailable__"   # sentinel prefix in the errors list
-
-
-def _osm_call(fn):
-    """Run an OSMnx fetch, trying each Overpass mirror in turn on a genuine connection,
-    timeout, or rate-limit (HTTP 429/5xx) failure. A 'no data found' answer is NOT retried
-    (with request pacing on, that means the area really has none of that feature) so empty
-    layers return quickly. If every mirror fails, the last error propagates."""
-    last = None
-    for ep in OVERPASS_ENDPOINTS:
-        try:
-            ox.settings.overpass_url = ep
-        except Exception:
-            pass
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            m = str(e).lower()
-            retryable = any(s in m for s in (
-                "connection", "max retries", "timed out", "timeout", "refused",
-                "temporarily", "502", "503", "504", "gateway",
-                "too many requests", "429"))
-            if not retryable:
-                raise
-    raise last
+def _postpass(sql, timeout=60):
+    """POST a SQL query to Postpass, return the result as a GeoDataFrame (may be empty)."""
+    r = requests.post(POSTPASS_URL, data={"data": sql}, timeout=timeout)
+    r.raise_for_status()
+    feats = r.json().get("features", [])
+    return gpd.GeoDataFrame.from_features(feats, crs=4326) if feats \
+        else gpd.GeoDataFrame(geometry=[], crs=4326)
 
 
 @st.cache_data(show_spinner=False)
-def _fetch_osm_cached(bounds_wgs):
-    """Fetch OSM layers. Raises if *nothing* loads, so a transient Overpass failure is
-    NOT cached (a later retry can succeed); genuine partial/empty results are cached."""
-    left, bottom, right, top = bounds_wgs
-    poly = box(left, bottom, right, top)
-
-    def _benign(e):
-        # An area can genuinely have none of a feature (e.g. no drivable roads in a
-        # remote/mountain AOI). After _osm_call has exhausted the mirrors, treat such a
-        # "no data found" as 0 rather than a connection/SSL failure.
-        m = str(e).lower()
-        return any(s in m for s in (
-            "no edges", "no graph nodes", "found no", "insufficient response",
-            "no data elements", "no matching features"))
-
-    layers, errors = {}, []
-    for name, tags in OSM_TAGS.items():
-        try:
-            g = _osm_call(lambda t=tags: ox.features_from_polygon(poly, t))
-            g = g[~g.geometry.is_empty & g.geometry.notna()]
-            layers[name] = g.to_crs(4326)
-        except Exception as e:
-            layers[name] = gpd.GeoDataFrame(geometry=[], crs=4326)
-            if not _benign(e):
-                errors.append(f"{name}: {type(e).__name__}: {e}")
-    try:
-        g = _osm_call(lambda: ox.features_from_polygon(poly, ROAD_TAGS))
-        # keep only the road lines (highway tags also return points like traffic signals)
-        g = g[g.geometry.type.isin(["LineString", "MultiLineString"])]
-        g = g[~g.geometry.is_empty & g.geometry.notna()]
-        layers["roads"] = g.to_crs(4326)
-    except Exception as e:
-        layers["roads"] = gpd.GeoDataFrame(geometry=[], crs=4326)
-        if not _benign(e):
-            errors.append(f"roads: {type(e).__name__}: {e}")
-
-    # Every layer empty over a real AOI almost always means Overpass was rate-limiting /
-    # unreachable, not that the place has zero roads. Raise so this is NOT cached.
-    if sum(len(v) for v in layers.values()) == 0:
-        raise RuntimeError("Overpass returned no features for any layer")
-    return layers, errors
+def _fetch_facilities_cached(bounds_wgs):
+    """Fetch schools + clinics within the scene bbox from Postpass. Raises on a real
+    service error (so it isn't cached and a retry can succeed); a genuine empty result
+    is fine and cached."""
+    w, s, e, n = bounds_wgs
+    env = f"st_makeenvelope({w},{s},{e},{n},4326)"
+    layers = {}
+    for name, cond in FACILITY_COND.items():
+        sql = f"SELECT tags, geom FROM postpass_pointpolygon WHERE {cond} AND geom && {env}"
+        layers[name] = _postpass(sql, timeout=45)
+    return layers
 
 
 def fetch_osm(bounds_wgs):
-    """Wrapper: on total failure, return empty layers flagged with the OSM_UNAVAILABLE
-    sentinel (uncached, so clicking Run again retries)."""
+    """Facility layers (schools, clinics) from Postpass. On a service failure, return empty
+    layers flagged with OSM_UNAVAILABLE (uncached, so a re-run retries). Roads are handled
+    separately by roads_hit() because they're counted server-side against the flood."""
     try:
-        return _fetch_osm_cached(bounds_wgs)
+        return _fetch_facilities_cached(bounds_wgs), []
     except Exception as e:
-        empty = {k: gpd.GeoDataFrame(geometry=[], crs=4326)
-                 for k in list(OSM_TAGS) + ["roads"]}
+        empty = {k: gpd.GeoDataFrame(geometry=[], crs=4326) for k in FACILITY_COND}
         return empty, [f"{OSM_UNAVAILABLE}: {type(e).__name__}: {e}"]
+
+
+def roads_hit(flood_gdf):
+    """Count OSM roads that cross the flood. Postpass does the intersection server-side
+    (ST_Intersects) so only the roads actually hit come back — fast, small payload — rather
+    than downloading every road in the scene. Returns (count, error_or_None)."""
+    if flood_gdf is None or flood_gdf.empty:
+        return 0, None
+    try:
+        # simplify (~200 m) purely to keep the WKT small; it's only used for counting
+        fu = flood_gdf.union_all().simplify(0.002)
+        sql = (f"SELECT ST_PointOnSurface(geom) AS geom FROM postpass_line "
+               f"WHERE tags->>'highway' IN ({_ROAD_CLASSES}) "
+               f"AND ST_Intersects(geom, ST_GeomFromText('{fu.wkt}',4326))")
+        return len(_postpass(sql, timeout=60)), None
+    except Exception as e:
+        return None, f"roads: {type(e).__name__}: {e}"
 
 
 def exposure(layers, flood_gdf):
@@ -678,19 +643,19 @@ if d_crs is None:
 _b = gpd.GeoSeries([box(*d_bounds)], crs=d_crs.to_wkt()
                    ).to_crs(4326).total_bounds
 bounds_wgs = (float(_b[0]), float(_b[1]), float(_b[2]), float(_b[3]))
-with st.spinner("Fetching OpenStreetMap infrastructure over the scene…"):
+with st.spinner("Fetching OpenStreetMap infrastructure (schools, clinics, roads)…"):
     layers, osm_errors = fetch_osm(tuple(bounds_wgs))
+    n_roads_hit, road_err = roads_hit(flood_gdf)
+    if road_err:
+        osm_errors = list(osm_errors) + [road_err]
 if any(e.startswith(OSM_UNAVAILABLE) for e in osm_errors):
     st.warning(
-        "⚠️ **OpenStreetMap infrastructure couldn't be loaded** — the Overpass data service "
-        "is rate-limiting or unreachable right now (common from cloud servers). Exposure "
-        "counts below are unavailable, **not zero** — click **🌊 Run analysis** again to retry "
-        "in a moment. (If this area is genuinely unmapped in OSM, it will keep showing 0.)")
+        "⚠️ **OpenStreetMap data couldn't be loaded** — the Postpass service is unreachable "
+        "right now. Exposure counts below are unavailable, **not zero** — click "
+        "**🌊 Run analysis** again to retry in a moment.")
 elif osm_errors:
     st.warning(
-        "Some OpenStreetMap layers couldn't be loaded, so their counts may be 0. "
-        "A connection/SSL error here is usually antivirus or proxy HTTPS scanning, not the "
-        "flood detection (an area with a feature simply unmapped shows 0 without an error). "
+        "Some OpenStreetMap layers couldn't be loaded, so their counts may be incomplete. "
         "Details:\n\n" + "\n\n".join(osm_errors))
 rows, exposed = exposure(layers, flood_gdf)
 
@@ -749,7 +714,7 @@ m1, m2, m3 = st.columns(3)
 m1.metric("Schools exposed", f"{rows['schools'][1]} / {rows['schools'][0]}")
 m2.metric("Clinics & hospitals exposed",
           f"{rows['clinics'][1]} / {rows['clinics'][0]}")
-m3.metric("Roads hit", f"{rows['roads'][1]:,}")
+m3.metric("Roads hit", f"{n_roads_hit:,}" if n_roads_hit is not None else "—")
 st.caption(
     "These counts come from FloodLens's **live SAR detection**, which is deliberately "
     "conservative in dense urban areas (radar can't see water between buildings). The "
