@@ -175,10 +175,15 @@ OVERPASS_ENDPOINTS = ["https://overpass-api.de/api",
                       "https://overpass.osm.ch/api"]
 
 
+OSM_UNAVAILABLE = "__osm_unavailable__"   # sentinel prefix in the errors list
+
+
 def _osm_call(fn):
-    """Run an OSMnx fetch, retrying on the next Overpass mirror if one refuses the
-    connection or times out. Non-connection errors (incl. 'no data found') propagate
-    immediately so the caller can classify them."""
+    """Run an OSMnx fetch, trying each Overpass mirror in turn. Retries the next mirror
+    on connection/timeout failures AND on rate-limit / empty-response signals — the latter
+    because a busy Overpass often returns an empty result that looks like 'no data' but is
+    really a soft rejection. A definitive empty answer from the graph builder ('no edges' /
+    'no graph nodes') is not retried. If every mirror fails, the last error propagates."""
     last = None
     for ep in OVERPASS_ENDPOINTS:
         try:
@@ -190,30 +195,33 @@ def _osm_call(fn):
         except Exception as e:
             last = e
             m = str(e).lower()
-            transient = any(s in m for s in (
+            definitive_empty = "no edges" in m or "no graph nodes" in m
+            retryable = not definitive_empty and any(s in m for s in (
                 "connection", "max retries", "timed out", "timeout", "refused",
-                "temporarily", "502", "503", "504", "gateway"))
-            if not transient:
+                "temporarily", "502", "503", "504", "gateway", "too many requests",
+                "429", "insufficient", "no data elements", "found no", "no matching"))
+            if not retryable:
                 raise
     raise last
 
 
 @st.cache_data(show_spinner=False)
-def fetch_osm(bounds_wgs):
+def _fetch_osm_cached(bounds_wgs):
+    """Fetch OSM layers. Raises if *nothing* loads, so a transient Overpass failure is
+    NOT cached (a later retry can succeed); genuine partial/empty results are cached."""
     left, bottom, right, top = bounds_wgs
     poly = box(left, bottom, right, top)
 
     def _benign(e):
-        # OSMnx raises when an area simply has none of a feature (e.g. no drivable
-        # roads in a remote/mountain AOI). That's "0 found", not a failure — keep it
-        # out of the errors list so it isn't mistaken for a connection/SSL problem.
+        # An area can genuinely have none of a feature (e.g. no drivable roads in a
+        # remote/mountain AOI). After _osm_call has exhausted the mirrors, treat such a
+        # "no data found" as 0 rather than a connection/SSL failure.
         m = str(e).lower()
         return any(s in m for s in (
             "no edges", "no graph nodes", "found no", "insufficient response",
             "no data elements", "no matching features"))
 
-    layers = {}
-    errors = []
+    layers, errors = {}, []
     for name, tags in OSM_TAGS.items():
         try:
             g = _osm_call(lambda t=tags: ox.features_from_polygon(poly, t))
@@ -231,7 +239,23 @@ def fetch_osm(bounds_wgs):
         layers["roads"] = gpd.GeoDataFrame(geometry=[], crs=4326)
         if not _benign(e):
             errors.append(f"roads: {type(e).__name__}: {e}")
+
+    # Every layer empty over a real AOI almost always means Overpass was rate-limiting /
+    # unreachable, not that the place has zero roads. Raise so this is NOT cached.
+    if sum(len(v) for v in layers.values()) == 0:
+        raise RuntimeError("Overpass returned no features for any layer")
     return layers, errors
+
+
+def fetch_osm(bounds_wgs):
+    """Wrapper: on total failure, return empty layers flagged with the OSM_UNAVAILABLE
+    sentinel (uncached, so clicking Run again retries)."""
+    try:
+        return _fetch_osm_cached(bounds_wgs)
+    except Exception as e:
+        empty = {k: gpd.GeoDataFrame(geometry=[], crs=4326)
+                 for k in list(OSM_TAGS) + ["roads"]}
+        return empty, [f"{OSM_UNAVAILABLE}: {type(e).__name__}: {e}"]
 
 
 def exposure(layers, flood_gdf):
@@ -635,7 +659,13 @@ _b = gpd.GeoSeries([box(*d_bounds)], crs=d_crs.to_wkt()
 bounds_wgs = (float(_b[0]), float(_b[1]), float(_b[2]), float(_b[3]))
 with st.spinner("Fetching OpenStreetMap infrastructure over the scene…"):
     layers, osm_errors = fetch_osm(tuple(bounds_wgs))
-if osm_errors:
+if any(e.startswith(OSM_UNAVAILABLE) for e in osm_errors):
+    st.warning(
+        "⚠️ **OpenStreetMap infrastructure couldn't be loaded** — the Overpass data service "
+        "is rate-limiting or unreachable right now (common from cloud servers). Exposure "
+        "counts below are unavailable, **not zero** — click **🌊 Run analysis** again to retry "
+        "in a moment. (If this area is genuinely unmapped in OSM, it will keep showing 0.)")
+elif osm_errors:
     st.warning(
         "Some OpenStreetMap layers couldn't be loaded, so their counts may be 0. "
         "A connection/SSL error here is usually antivirus or proxy HTTPS scanning, not the "
