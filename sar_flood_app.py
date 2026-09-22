@@ -174,6 +174,15 @@ OVERPASS_ENDPOINTS = ["https://overpass-api.de/api",
                       "https://overpass.kumi.systems/api",
                       "https://overpass.osm.ch/api"]
 
+# OSMnx defaults to a 180s request timeout — far too long when an Overpass endpoint is
+# unresponsive, because our mirror fallback would then wait minutes per attempt. Fail fast
+# so a slow endpoint is abandoned quickly and the next mirror is tried.
+try:
+    ox.settings.requests_timeout = 25
+    ox.settings.overpass_rate_limit = False   # don't self-throttle; we manage fallbacks
+except Exception:
+    pass
+
 
 OSM_UNAVAILABLE = "__osm_unavailable__"   # sentinel prefix in the errors list
 
