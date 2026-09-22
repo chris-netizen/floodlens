@@ -174,12 +174,14 @@ OVERPASS_ENDPOINTS = ["https://overpass-api.de/api",
                       "https://overpass.kumi.systems/api",
                       "https://overpass.osm.ch/api"]
 
-# OSMnx defaults to a 180s request timeout — far too long when an Overpass endpoint is
-# unresponsive, because our mirror fallback would then wait minutes per attempt. Fail fast
-# so a slow endpoint is abandoned quickly and the next mirror is tried.
+# Keep OSMnx's request pacing ON: Overpass limits requests per IP, and firing the
+# schools / clinics / roads queries back-to-back gets the later (heavier) ones rejected —
+# which showed up as clinics and roads silently returning 0 while schools loaded. The
+# rate limiter waits for the server's slot so each query succeeds. Use a generous-but-
+# bounded timeout so the heavy road-network graph completes without hanging for minutes.
 try:
-    ox.settings.requests_timeout = 25
-    ox.settings.overpass_rate_limit = False   # don't self-throttle; we manage fallbacks
+    ox.settings.requests_timeout = 120
+    ox.settings.overpass_rate_limit = True
 except Exception:
     pass
 
@@ -188,11 +190,10 @@ OSM_UNAVAILABLE = "__osm_unavailable__"   # sentinel prefix in the errors list
 
 
 def _osm_call(fn):
-    """Run an OSMnx fetch, trying each Overpass mirror in turn. Retries the next mirror
-    on connection/timeout failures AND on rate-limit / empty-response signals — the latter
-    because a busy Overpass often returns an empty result that looks like 'no data' but is
-    really a soft rejection. A definitive empty answer from the graph builder ('no edges' /
-    'no graph nodes') is not retried. If every mirror fails, the last error propagates."""
+    """Run an OSMnx fetch, trying each Overpass mirror in turn on a genuine connection,
+    timeout, or rate-limit (HTTP 429/5xx) failure. A 'no data found' answer is NOT retried
+    (with request pacing on, that means the area really has none of that feature) so empty
+    layers return quickly. If every mirror fails, the last error propagates."""
     last = None
     for ep in OVERPASS_ENDPOINTS:
         try:
@@ -204,11 +205,10 @@ def _osm_call(fn):
         except Exception as e:
             last = e
             m = str(e).lower()
-            definitive_empty = "no edges" in m or "no graph nodes" in m
-            retryable = not definitive_empty and any(s in m for s in (
+            retryable = any(s in m for s in (
                 "connection", "max retries", "timed out", "timeout", "refused",
-                "temporarily", "502", "503", "504", "gateway", "too many requests",
-                "429", "insufficient", "no data elements", "found no", "no matching"))
+                "temporarily", "502", "503", "504", "gateway",
+                "too many requests", "429"))
             if not retryable:
                 raise
     raise last
