@@ -58,6 +58,12 @@ st.set_page_config(page_title="FloodLens — SAR flood exposure", layout="wide")
 
 OSM_TAGS = {"schools": {"amenity": "school"},
             "clinics": {"amenity": ["clinic", "hospital", "doctors"], "healthcare": True}}
+# Roads as plain highway line-features (drivable classes). Much lighter on Overpass than
+# building a routable network graph — we only need the segments to count and map, not routing.
+ROAD_TAGS = {"highway": ["motorway", "trunk", "primary", "secondary", "tertiary",
+                         "unclassified", "residential", "living_street",
+                         "motorway_link", "trunk_link", "primary_link",
+                         "secondary_link", "tertiary_link"]}
 UTM_HINT = None  # auto-picked per scene
 
 
@@ -241,9 +247,11 @@ def _fetch_osm_cached(bounds_wgs):
             if not _benign(e):
                 errors.append(f"{name}: {type(e).__name__}: {e}")
     try:
-        roads = ox.graph_to_gdfs(_osm_call(lambda: ox.graph_from_polygon(
-            poly, network_type="drive")), nodes=False)
-        layers["roads"] = roads.to_crs(4326)
+        g = _osm_call(lambda: ox.features_from_polygon(poly, ROAD_TAGS))
+        # keep only the road lines (highway tags also return points like traffic signals)
+        g = g[g.geometry.type.isin(["LineString", "MultiLineString"])]
+        g = g[~g.geometry.is_empty & g.geometry.notna()]
+        layers["roads"] = g.to_crs(4326)
     except Exception as e:
         layers["roads"] = gpd.GeoDataFrame(geometry=[], crs=4326)
         if not _benign(e):
@@ -276,9 +284,13 @@ def exposure(layers, flood_gdf):
         if gdf.empty:
             rows[name] = (0, 0)
             continue
-        pts = gdf.copy()
-        pts["geometry"] = pts.geometry.representative_point()
-        hit = pts[pts.geometry.within(fu)]
+        if name == "roads":
+            # roads are lines: a road is "hit" if it crosses the flood at all
+            hit = gdf[gdf.geometry.intersects(fu)]
+        else:
+            pts = gdf.copy()
+            pts["geometry"] = pts.geometry.representative_point()
+            hit = pts[pts.geometry.within(fu)]
         rows[name] = (len(gdf), len(hit))
         if len(hit) and name in ("schools", "clinics"):
             h = hit.copy()
@@ -737,7 +749,7 @@ m1, m2, m3 = st.columns(3)
 m1.metric("Schools exposed", f"{rows['schools'][1]} / {rows['schools'][0]}")
 m2.metric("Clinics & hospitals exposed",
           f"{rows['clinics'][1]} / {rows['clinics'][0]}")
-m3.metric("Road segments cut", f"{rows['roads'][1]:,}")
+m3.metric("Roads hit", f"{rows['roads'][1]:,}")
 st.caption(
     "These counts come from FloodLens's **live SAR detection**, which is deliberately "
     "conservative in dense urban areas (radar can't see water between buildings). The "
